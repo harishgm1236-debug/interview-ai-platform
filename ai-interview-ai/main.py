@@ -1,31 +1,31 @@
-# main.py - Production Safe Version
+# main.py - Synchronous Version (Compatible with Frontend)
 
 import os
 import io
 import uuid
 import json
 import shutil
+import random
+import base64
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pydub import AudioSegment
+from pypdf import PdfReader
 
 from question_bank import QUESTION_BANK
 from evaluator import evaluate_multimodal, sanitize_for_json
 
 app = FastAPI(
     title="AI Interview Evaluation Service",
-    version="2.1.0"
+    version="2.2.0"
 )
 
-# -------------------------
-# CORS (restrict in production)
-# -------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with frontend URL in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -37,7 +37,7 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # -------------------------
-# ROOT ROUTE (Fixes Not Found)
+# ROOT ROUTE (Fixes "Not Found")
 # -------------------------
 @app.get("/")
 async def root():
@@ -47,16 +47,9 @@ async def root():
         "health": "/health"
     }
 
-# -------------------------
-# Health Check
-# -------------------------
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "service": "AI Interview Engine",
-        "version": "2.1.0"
-    }
+    return {"status": "healthy", "service": "AI Interview Engine"}
 
 # -------------------------
 # Models
@@ -66,30 +59,7 @@ class StartRequest(BaseModel):
     level: Optional[str] = "all"
 
 # -------------------------
-# Check FFmpeg Availability
-# -------------------------
-def check_ffmpeg():
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("FFmpeg not installed on server")
-
-# -------------------------
-# Audio Conversion
-# -------------------------
-def save_uploaded_audio_as_wav(upload: UploadFile, audio_bytes: bytes) -> str:
-    check_ffmpeg()
-
-    source_format = upload.filename.split(".")[-1] if "." in upload.filename else "webm"
-
-    wav_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.wav")
-
-    audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=source_format)
-    audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
-    audio.export(wav_path, format="wav")
-
-    return wav_path
-
-# -------------------------
-# Session Helpers
+# Helpers
 # -------------------------
 def save_session(session_id, data):
     path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
@@ -103,12 +73,37 @@ def load_session(session_id):
             return json.load(f)
     return None
 
+def check_ffmpeg():
+    if not shutil.which("ffmpeg"):
+        # Log warning but don't crash, pydub might fallback
+        print("WARNING: FFmpeg not found on server path")
+
+def save_uploaded_audio_as_wav(upload: UploadFile, audio_bytes: bytes) -> str:
+    check_ffmpeg()
+    wav_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.wav")
+    try:
+        # Detect format from filename or assume webm
+        fmt = "webm"
+        if upload.filename.lower().endswith(".wav"): fmt = "wav"
+        if upload.filename.lower().endswith(".mp3"): fmt = "mp3"
+        if upload.filename.lower().endswith(".m4a"): fmt = "m4a"
+
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=fmt)
+        audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
+        audio.export(wav_path, format="wav")
+    except Exception as e:
+        print(f"Audio conversion error: {e}")
+        # Fallback: save raw bytes if conversion fails
+        with open(wav_path, "wb") as f:
+            f.write(audio_bytes)
+            
+    return wav_path
+
 # -------------------------
 # Start Interview
 # -------------------------
 @app.post("/interview/start")
 async def start(req: StartRequest):
-
     session_id = str(uuid.uuid4())
     domain_key = req.domain.lower().replace(" ", "").replace("-", "")
 
@@ -116,57 +111,96 @@ async def start(req: StartRequest):
         domain_key = "backend"
 
     raw_rounds = QUESTION_BANK[domain_key]
-    questions = []
+    flattened_questions = []
 
-    for r in raw_rounds:
-        questions.extend(raw_rounds[r])
+    # Filter logic
+    if req.level and req.level != "all":
+        level_map = {"easy": "round_1_background", "medium": "round_2_domain", "hard": "round_3_project"}
+        rk = level_map.get(req.level)
+        if rk: flattened_questions = list(raw_rounds[rk])
+        else:
+            for r in raw_rounds: flattened_questions.extend(raw_rounds[r])
+    else:
+        for r in raw_rounds: flattened_questions.extend(raw_rounds[r])
+
+    random.shuffle(flattened_questions)
+    if req.level == "all": flattened_questions = flattened_questions[:10]
 
     session_data = {
         "session_id": session_id,
         "domain": domain_key,
         "level": req.level,
-        "questions": questions,
-        "scores": []
+        "questions": flattened_questions,
+        "scores": [],
+        "total_questions": len(flattened_questions)
     }
-
     save_session(session_id, session_data)
+
+    # Return safe questions (no model answer)
+    safe_q = [{"q": q["q"], "category": q.get("category", "technical")} for q in flattened_questions]
 
     return {
         "session_id": session_id,
-        "total_questions": len(questions)
+        "domain": domain_key,
+        "total_questions": len(flattened_questions),
+        "questions": safe_q
     }
 
 # -------------------------
-# Background Evaluation Logic
+# Resume Start
 # -------------------------
-def process_evaluation(session_id, index, answer_text, img_path, audio_path):
-    session = load_session(session_id)
-    q_data = session["questions"][index]
+@app.post("/interview/resume/start")
+async def start_resume(file: UploadFile = File(...)):
+    session_id = str(uuid.uuid4())
+    pdf_path = os.path.join(TEMP_DIR, f"{session_id}.pdf")
+    content = await file.read()
+    with open(pdf_path, "wb") as f: f.write(content)
 
-    eval_res = evaluate_multimodal(
-        answer_text=answer_text,
-        keywords=q_data.get("keywords", []),
-        weight=q_data.get("weight", 1.0),
-        image_path=img_path,
-        audio_path=audio_path,
-        model_answer=q_data.get("model_answer", "")
-    )
+    try:
+        reader = PdfReader(pdf_path)
+        text = "".join([p.extract_text() for p in reader.pages]).lower()
+    except: text = ""
 
-    result = sanitize_for_json(eval_res)
-    session["scores"].append(result)
-    save_session(session_id, session)
+    # Simple Keyword Matching
+    questions = []
+    keywords = {
+        "react": "frontend", "node": "backend", "python": "datascience", 
+        "aws": "devops", "sql": "backend", "docker": "devops"
+    }
+    found = set()
+    for k, v in keywords.items():
+        if k in text: found.add(v)
+    
+    if not found: found.add("fullstack")
 
-    # Cleanup
-    for p in [img_path, audio_path]:
-        if os.path.exists(p):
-            os.remove(p)
+    for d in found:
+        if d in QUESTION_BANK:
+            rounds = QUESTION_BANK[d].get("round_2_domain", [])
+            if rounds: questions.extend(random.sample(rounds, min(2, len(rounds))))
+
+    questions.append({
+        "q": "Based on your resume, describe a challenging project.",
+        "category": "behavioral", "weight": 1.0
+    })
+
+    session_data = {
+        "session_id": session_id,
+        "domain": "resume",
+        "level": "custom",
+        "questions": questions,
+        "scores": [],
+        "total_questions": len(questions)
+    }
+    save_session(session_id, session_data)
+    if os.path.exists(pdf_path): os.remove(pdf_path)
+
+    return {"session_id": session_id, "total_questions": len(questions)}
 
 # -------------------------
-# Evaluate Endpoint (Non-blocking)
+# Evaluate (Synchronous)
 # -------------------------
 @app.post("/interview/evaluate")
 async def evaluate(
-    background_tasks: BackgroundTasks,
     session_id: str = Form(...),
     index: int = Form(...),
     answer_text: str = Form(""),
@@ -174,43 +208,61 @@ async def evaluate(
     audio: UploadFile = File(...)
 ):
     session = load_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    if not session: raise HTTPException(404, "Session not found")
 
+    q_data = session["questions"][int(index)]
+
+    # Save Files
     img_bytes = await image.read()
     img_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.jpg")
-
-    with open(img_path, "wb") as f:
-        f.write(img_bytes)
+    with open(img_path, "wb") as f: f.write(img_bytes)
 
     audio_bytes = await audio.read()
+    audio_path = ""
+    if len(audio_bytes) > 100:
+        audio_path = save_uploaded_audio_as_wav(audio, audio_bytes)
 
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="Invalid audio file")
+    try:
+        # Run AI Evaluation (Blocking)
+        eval_res = evaluate_multimodal(
+            answer_text=answer_text,
+            keywords=q_data.get("keywords", []),
+            weight=q_data.get("weight", 1.0),
+            image_path=img_path,
+            audio_path=audio_path,
+            model_answer=q_data.get("model_answer", "")
+        )
 
-    audio_path = save_uploaded_audio_as_wav(audio, audio_bytes)
+        result = sanitize_for_json(eval_res)
+        session["scores"].append(result)
 
-    background_tasks.add_task(
-        process_evaluation,
-        session_id,
-        index,
-        answer_text,
-        img_path,
-        audio_path
-    )
+        # Check Finished
+        is_finished = int(index) >= len(session["questions"]) - 1
+        final_summary = None
 
-    return {
-        "message": "Evaluation started",
-        "status": "processing"
-    }
+        if is_finished:
+            # Simple average logic for summary
+            total = sum(s["overall_marks"] for s in session["scores"])
+            final_summary = {
+                "total_marks": total,
+                "percentage": (total / (len(session["questions"]) * 10)) * 100,
+                "grade": "A" if total > 40 else "B"
+            }
+            session["final_result"] = final_summary
 
-# -------------------------
-# Get Session
-# -------------------------
+        save_session(session_id, session)
+
+        return {
+            "finished": is_finished,
+            "current_score": result,
+            "final_result": final_summary
+        }
+
+    finally:
+        # Cleanup
+        if os.path.exists(img_path): os.remove(img_path)
+        if audio_path and os.path.exists(audio_path): os.remove(audio_path)
+
 @app.get("/interview/session/{session_id}")
 async def get_session(session_id: str):
-    session = load_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    return sanitize_for_json(session)
+    return load_session(session_id)
